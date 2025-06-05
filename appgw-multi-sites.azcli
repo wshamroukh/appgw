@@ -32,7 +32,7 @@ runcmd:
   - reboot
 EOF
 
-"# Resource Groups
+# Resource Groups
 echo -e "\e[1;36mCreating $rg Resource Group...\e[0m"
 az group create -l $location -n $rg -o none
 
