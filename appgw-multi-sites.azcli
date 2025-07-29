@@ -1,23 +1,22 @@
-rg=appgw-multisites
+rg=appgw-multi-websites
 location=centralindia
 
-vnet_name=vnet
+vnet_name=appgw
 vnet_address=10.11.0.0/16
 appgw_subnet_name=appgw
 appgw_subnet_address=10.11.0.0/24
 vm_subnet_name=vm
 vm_subnet_address=10.11.1.0/24
 
-vm1_name=site1
-vm2_name=site2
+vm1_name=website1
+vm2_name=website2
 appgw_name=appgw
 
 admin_username=$(whoami)
 admin_password=Test#123#123
 vm_size=Standard_B2ats_v2
-vm_image=$(az vm image list -l $location -p Canonical -s 22_04-lts --all --query "[?offer=='0001-com-ubuntu-server-jammy'].urn" -o tsv | sort -u | tail -n 1) && echo $vm_image
 
-cloudinit_file=~/cloudinit.txt
+cloudinit_file=cloudinit.txt
 cat <<EOF > $cloudinit_file
 #cloud-config
 runcmd:
@@ -44,26 +43,37 @@ az network vnet subnet create -g $rg -n $vm_subnet_name --address-prefixes $vm_s
 # vm1
 echo -e "\e[1;36mDeploying $vm1_name VM...\e[0m"
 az network nic create -g $rg -n $vm1_name -l $location --vnet-name $vnet_name --subnet $vm_subnet_name -o none
-az vm create -g $rg -n $vm1_name -l $location --image $vm_image --nics $vm1_name --os-disk-name $vm1_name --size $vm_size --admin-username $admin_username --admin-password $admin_password --custom-data $cloudinit_file --no-wait
-vm1_ip=$(az network nic show -g $rg -n $vm1_name --query ipConfigurations[0].privateIPAddress -o tsv) && echo $vm1_name vm private ip: $vm1_ip
+az vm create -g $rg -n $vm1_name -l $location --image Ubuntu2404 --nics $vm1_name --os-disk-name $vm1_name --size $vm_size --admin-username $admin_username --generate-ssh-keys --custom-data $cloudinit_file --no-wait
+vm1_ip=$(az network nic show -g $rg -n $vm1_name --query ipConfigurations[0].privateIPAddress -o tsv | tr -d '\r') && echo $vm1_name vm private ip: $vm1_ip
 
 # vm2
 echo -e "\e[1;36mDeploying $vm2_name VM...\e[0m"
 az network nic create -g $rg -n $vm2_name -l $location --vnet-name $vnet_name --subnet $vm_subnet_name -o none
-az vm create -g $rg -n $vm2_name -l $location --image $vm_image --nics $vm2_name --os-disk-name $vm2_name --size $vm_size --admin-username $admin_username --admin-password $admin_password --custom-data $cloudinit_file --no-wait
-vm2_ip=$(az network nic show -g $rg -n $vm2_name --query ipConfigurations[0].privateIPAddress -o tsv) && echo $vm2_name vm private ip: $vm2_ip
+az vm create -g $rg -n $vm2_name -l $location --image Ubuntu2404 --nics $vm2_name --os-disk-name $vm2_name --size $vm_size --admin-username $admin_username --generate-ssh-keys --custom-data $cloudinit_file --no-wait
+vm2_ip=$(az network nic show -g $rg -n $vm2_name --query ipConfigurations[0].privateIPAddress -o tsv | tr -d '\r') && echo $vm2_name vm private ip: $vm2_ip
 
 # clean up cloudinit file
 rm $cloudinit_file
 
+# create log analytics workspace
+echo -e "\e[1;36mCreating Log Analytics Workspace...\e[0m"
+az monitor log-analytics workspace create -g $rg -n $appgw_name-law -o none
+lawid=$(az monitor log-analytics workspace show -g $rg -n $appgw_name-law --query id -o tsv | tr -d '\r')
+
 # application gateway
 echo -e "\e[1;36mCreating $appgw_name Application Gateway...\e[0m"
 az network public-ip create -g $rg -n $appgw_name-ip --allocation-method Static --sku Standard -o none
-appgwpip=$(az network public-ip show -g $rg -n $appgw_name-ip --query ipAddress -o tsv)
-az network application-gateway create -g $rg -n $appgw_name --capacity 1 --sku Standard_v2 --vnet-name $vnet_name --public-ip-address $appgw_name-ip --subnet $appgw_subnet_name --priority 100 -o none
-appgwprivip=$(az network application-gateway show -g $rg -n $appgw_name --query frontendIPConfigurations[0].privateIPAddress -o tsv)
-frontendid=$(az network application-gateway show -g $rg -n $appgw_name --query frontendIPConfigurations[0].id -o tsv)
-frontendportid=$(az network application-gateway show -g $rg -n $appgw_name --query frontendPorts[0].id -o tsv)
+appgwpip=$(az network public-ip show -g $rg -n $appgw_name-ip --query ipAddress -o tsv | tr -d '\r') && echo $appgw_name public ip: $appgwpip
+az network application-gateway waf-policy create -g $rg -n $appgw_name-waf-policy -o none
+az network application-gateway waf-policy policy-setting update -g $rg --policy-name $appgw_name-waf-policy --state Enabled -o none
+az network application-gateway create -g $rg -n $appgw_name --capacity 1 --sku WAF_v2 --waf-policy $appgw_name-waf-policy --vnet-name $vnet_name --public-ip-address $appgw_name-ip --subnet $appgw_subnet_name --priority 100 -o none
+appgw_id=$(az network application-gateway show -g $rg -n $appgw_name --query id -o tsv | tr -d '\r')
+frontendid=$(az network application-gateway show -g $rg -n $appgw_name --query frontendIPConfigurations[0].id -o tsv | tr -d '\r')
+frontendportid=$(az network application-gateway show -g $rg -n $appgw_name --query frontendPorts[0].id -o tsv | tr -d '\r')
+
+# enable diagnostics logging for application gateway
+echo -e "\e[1;36mEnabling diagnostics logging for $appgw_name Application Gateway...\e[0m"
+az monitor diagnostic-settings create -g $rg -n $appgw_name --workspace $lawid --resource $appgw_id --export-to-resource-specific true --logs '[{"category":"ApplicationGatewayAccessLog","Enabled":true}, {"category":"ApplicationGatewayFirewallLog","Enabled":true},{"category":"ApplicationGatewayPerformanceLog","Enabled":true}]' -o none
 
 echo -e "\e[1;36mCreating a backend pool in $appgw_name Application Gateway for $vm1_name...\e[0m"
 az network application-gateway address-pool create -g $rg -n $vm1_name-pool --gateway-name $appgw_name --servers $vm1_ip -o none
@@ -77,9 +87,6 @@ az network application-gateway http-listener create -g $rg -n $vm1_name-http-lis
 echo -e "\e[1;36mCreating an HTTP listener in $appgw_name Application Gateway for $vm2_name...\e[0m"
 az network application-gateway http-listener create -g $rg -n $vm2_name-http-listener --gateway-name $appgw_name --frontend-ip $frontendid --frontend-port $frontendportid --host-name ${vm2_name}.${appgwpip}.nip.io -o none
 
-echo -e "\e[1;36mDeleteing default listener in $appgw_name Application Gateway as it is not needed anymore...\e[0m"
-az network application-gateway http-listener delete -g $rg -n appGatewayHttpListener --gateway-name $appgw_name -o none
-
 echo -e "\e[1;36mCreating a routing rule in $appgw_name Application Gateway for $vm1_name...\e[0m"
 az network application-gateway rule create -g $rg -n $vm1_name-routing-rule --gateway-name $appgw_name --address-pool $vm1_name-pool --http-listener $vm1_name-http-listener --rule-type Basic --priority 200 -o none
 
@@ -89,5 +96,17 @@ az network application-gateway rule create -g $rg -n $vm2_name-routing-rule --ga
 echo -e "\e[1;36mDeleteing default routing rule in $appgw_name Application Gateway as it is not needed anymore...\e[0m"
 az network application-gateway rule delete -g $rg -n rule1 --gateway-name $appgw_name -o none
 
+echo -e "\e[1;36mDeleteing default listener in $appgw_name Application Gateway as it is not needed anymore...\e[0m"
+az network application-gateway http-listener delete -g $rg -n appGatewayHttpListener --gateway-name $appgw_name -o none
+
+echo -e "\e[1;36mDeleteing default backend pool in $appgw_name Application Gateway as it is not needed anymore...\e[0m"
+az network application-gateway address-pool delete -g $rg -n appGatewayBackendPool --gateway-name $appgw_name -o none
+
+echo -e "\e[1;36mShow $appgw_name Application Gateway backend health for $vm1_name and $vm2_name...\e[0m"
+az network application-gateway show-backend-health -g $rg -n $appgw_name --query backendAddressPools[].backendHttpSettingsCollection[].servers[] -o table
+
 echo try now to access the first site: http://${vm1_name}.${appgwpip}.nip.io
 echo try now to access the second site: http://${vm2_name}.${appgwpip}.nip.io
+
+#cleanup
+# az group delete -g $rg -y --no-wait
