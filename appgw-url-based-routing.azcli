@@ -1,0 +1,118 @@
+rg=appgw-url-based-routing
+location=centralindia
+
+vnet_name=appgw
+vnet_address=10.11.0.0/16
+appgw_subnet_name=appgw
+appgw_subnet_address=10.11.0.0/24
+vm_subnet_name=vm
+vm_subnet_address=10.11.1.0/24
+
+vm1_name=rootwebsite
+vm2_name=dnswebsite
+vm3_name=sqlwebsite
+appgw_name=appgw
+
+admin_username=$(whoami)
+admin_password=Test#123#123
+vm_size=Standard_B2ats_v2
+
+cloudinit_file=cloudinit.txt
+cat <<EOF > $cloudinit_file
+#cloud-config
+runcmd:
+  - apt update && apt-get install -y dotnet-sdk-8.0 nginx git
+  - mv /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
+  - cd /etc/nginx/sites-available/ && curl -O https://raw.githubusercontent.com/wshamroukh/nginx-aspdotnet/refs/heads/main/default
+  - git clone https://github.com/jelledruyts/InspectorGadget /var/www/InspectorGadget
+  - mv /var/www/InspectorGadget/WebApp /var/www/ && rm -rf /var/www/InspectorGadget
+  - cd /etc/systemd/system/ && curl -O https://raw.githubusercontent.com/wshamroukh/nginx-aspdotnet/refs/heads/main/inspectorg.service
+  - systemctl enable inspectorg && systemctl start inspectorg
+  - nginx -t && nginx -s reload
+  - reboot
+EOF
+
+# Resource Groups
+echo -e "\e[1;36mCreating $rg Resource Group...\e[0m"
+az group create -l $location -n $rg -o none
+
+# vnet
+echo -e "\e[1;36mCreating $vnet_name VNet...\e[0m"
+az network vnet create -g $rg -n $vnet_name -l $location --address-prefixes $vnet_address --subnet-name $appgw_subnet_name --subnet-prefixes $appgw_subnet_address -o none
+az network vnet subnet create -g $rg -n $vm_subnet_name --address-prefixes $vm_subnet_address --vnet-name $vnet_name -o none
+
+# vm1
+echo -e "\e[1;36mDeploying $vm1_name VM...\e[0m"
+az network nic create -g $rg -n $vm1_name -l $location --vnet-name $vnet_name --subnet $vm_subnet_name -o none
+az vm create -g $rg -n $vm1_name -l $location --image Ubuntu2404 --nics $vm1_name --os-disk-name $vm1_name --size $vm_size --admin-username $admin_username --generate-ssh-keys --custom-data $cloudinit_file --no-wait
+vm1_ip=$(az network nic show -g $rg -n $vm1_name --query ipConfigurations[0].privateIPAddress -o tsv | tr -d '\r') && echo $vm1_name vm private ip: $vm1_ip
+
+# vm2
+echo -e "\e[1;36mDeploying $vm2_name VM...\e[0m"
+az network nic create -g $rg -n $vm2_name -l $location --vnet-name $vnet_name --subnet $vm_subnet_name -o none
+az vm create -g $rg -n $vm2_name -l $location --image Ubuntu2404 --nics $vm2_name --os-disk-name $vm2_name --size $vm_size --admin-username $admin_username --generate-ssh-keys --custom-data $cloudinit_file --no-wait
+vm2_ip=$(az network nic show -g $rg -n $vm2_name --query ipConfigurations[0].privateIPAddress -o tsv | tr -d '\r') && echo $vm2_name vm private ip: $vm2_ip
+
+# vm3
+echo -e "\e[1;36mDeploying $vm3_name VM...\e[0m"
+az network nic create -g $rg -n $vm3_name -l $location --vnet-name $vnet_name --subnet $vm_subnet_name -o none
+az vm create -g $rg -n $vm3_name -l $location --image Ubuntu2404 --nics $vm3_name --os-disk-name $vm3_name --size $vm_size --admin-username $admin_username --generate-ssh-keys --custom-data $cloudinit_file --no-wait
+vm3_ip=$(az network nic show -g $rg -n $vm3_name --query ipConfigurations[0].privateIPAddress -o tsv | tr -d '\r') && echo $vm3_name vm private ip: $vm3_ip
+
+# clean up cloudinit file
+rm $cloudinit_file
+
+# # create log analytics workspace
+# echo -e "\e[1;36mCreating Log Analytics Workspace...\e[0m"
+# az monitor log-analytics workspace create -g $rg -n $appgw_name-law -o none
+# lawid=$(az monitor log-analytics workspace show -g $rg -n $appgw_name-law --query id -o tsv | tr -d '\r')
+
+# application gateway
+echo -e "\e[1;36mCreating $appgw_name Application Gateway...\e[0m"
+az network public-ip create -g $rg -n $appgw_name-ip --allocation-method Static --sku Standard -o none
+appgwpip=$(az network public-ip show -g $rg -n $appgw_name-ip --query ipAddress -o tsv | tr -d '\r') && echo $appgw_name public ip: $appgwpip
+
+az network application-gateway create -g $rg -n $appgw_name --capacity 1 --sku Standard_V2 --http-settings-cookie-based-affinity Disabled --frontend-port 80 --http-settings-port 80 --http-settings-protocol Http --vnet-name $vnet_name --public-ip-address $appgw_name-ip --subnet $appgw_subnet_name --priority 100 -o none
+appgw_id=$(az network application-gateway show -g $rg -n $appgw_name --query id -o tsv | tr -d '\r')
+frontendid=$(az network application-gateway show -g $rg -n $appgw_name --query frontendIPConfigurations[0].id -o tsv | tr -d '\r')
+frontendportid=$(az network application-gateway show -g $rg -n $appgw_name --query frontendPorts[0].id -o tsv | tr -d '\r')
+
+# backend pools
+echo -e "\e[1;36mCreating a backend pool in $appgw_name Application Gateway for $vm1_name...\e[0m"
+az network application-gateway address-pool create -g $rg -n $vm1_name-pool --gateway-name $appgw_name --servers $vm1_ip -o none
+
+echo -e "\e[1;36mCreating a backend pool in $appgw_name Application Gateway for $vm2_name...\e[0m"
+az network application-gateway address-pool create -g $rg -n $vm2_name-pool --gateway-name $appgw_name --servers $vm2_ip -o none
+
+echo -e "\e[1;36mCreating a backend pool in $appgw_name Application Gateway for $vm3_name...\e[0m"
+az network application-gateway address-pool create -g $rg -n $vm3_name-pool --gateway-name $appgw_name --servers $vm3_ip -o none
+
+az network application-gateway frontend-port create -g $rg --gateway-name $appgw_name --name port8080 --port 8080 -o none
+
+# echo -e "\e[1;36mCreating an HTTP listener in $appgw_name Application Gateway...\e[0m"
+az network application-gateway http-listener update -g $rg --gateway-name $appgw_name --name appGatewayHttpListener --frontend-port port8080 -o none
+az network application-gateway http-listener create -g $rg -n http-listener --gateway-name $appgw_name --frontend-ip $frontendid --frontend-port $frontendportid --host-name ${appgwpip}.nip.io -o none
+
+
+az network application-gateway url-path-map create -g $rg --gateway-name $appgw_name -n myPathMap --paths /dnslookup/* --address-pool $vm2_name-pool --default-address-pool $vm2_name-pool --default-http-settings appGatewayBackendHttpSettings --http-settings appGatewayBackendHttpSettings --rule-name dnsPathRule -o none
+
+az network application-gateway url-path-map rule create -g $rg --gateway-name $appgw_name --name sqlPathRule --path-map-name myPathMap --paths /sqlconnection/* --address-pool $vm3_name-pool --http-settings appGatewayBackendHttpSettings -o none
+az network application-gateway url-path-map rule create -g $rg --gateway-name $appgw_name --name rootPathRule --path-map-name myPathMap --paths / --address-pool $vm1_name-pool --http-settings appGatewayBackendHttpSettings -o none
+
+az network application-gateway rule create -g $rg --gateway-name $appgw_name --name rule2 --http-listener http-listener --rule-type PathBasedRouting --url-path-map myPathMap --address-pool $vm1_name-pool --priority 200 -o none
+
+az network application-gateway url-path-map create -g $rg --gateway-name $appgw_name -n $vm1_name-url-path-map --rule-name $vm1_name-routing-rule --paths /* --address-pool $vm1_name-pool --default-address-pool $vm1_name-pool --http-settings $vm1_name-http-settings --default-http-settings $vm1_name-http-settings -o none
+
+az network application-gateway url-path-map rule create -g $rg --gateway-name $appgw_name --path-map-name $vm1_name-url-path-map -n $vm1_name-url-path-map-rule --paths "/*" --address-pool $vm1_name-pool --http-settings $vm1_name-http-settings -o none
+
+az network application-gateway url-path-map create -g $rg --gateway-name $appgw_name -n $vm2_name-url-path-map --rule-name $vm2_name-routing-rule --paths "/dnslookup/*" --address-pool $vm2_name-pool --default-address-pool $vm2_name-pool --http-settings $vm2_name-http-settings --default-http-settings $vm2_name-http-settings -o none
+
+az network application-gateway url-path-map create -g $rg --gateway-name $appgw_name -n $vm3_name-url-path-map --rule-name $vm3_name-routing-rule --paths "/sqlconnection/*" --address-pool $vm3_name-pool --default-address-pool $vm3_name-pool --http-settings $vm3_name-http-settings --default-http-settings $vm3_name-http-settings -o none
+
+
+echo try now to access the first site: http://${appgwpip}.nip.io
+echo try now to access the second site: http://${appgwpip}.nip.io/dnslookup
+echo try now to access the third site: http://${appgwpip}.nip.io/sqlconnection
+
+#cleanup
+# az group delete -g $rg -y --no-wait
